@@ -39,9 +39,9 @@ cp entropy $mnt/
 cp hosts $mnt/etc/hosts
 
 # install musl libc
-cp ${MUSL_BUILD}/lib/libc.so $mnt/lib/ld-musl-x86_64.so.1
-cp ${MUSL_BUILD}/lib/libc.so $mnt/lib/libc.musl-x86_64.so.1
-cp ${MUSL_BUILD}/lib/libc.so $mnt/lib/libc.so
+#cp ${MUSL_BUILD}/lib/libc.so $mnt/lib/ld-musl-x86_64.so.1
+#cp ${MUSL_BUILD}/lib/libc.so $mnt/lib/libc.musl-x86_64.so.1
+#cp ${MUSL_BUILD}/lib/libc.so $mnt/lib/libc.so
 
 umount $mnt
 rm -rf $mnt

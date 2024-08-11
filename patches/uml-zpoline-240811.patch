@@ -1,0 +1,528 @@
+Submodule linux-um-nommu contains modified content
+Submodule linux-um-nommu b0c967e..f1b394a:
+diff --git a/linux-um-nommu/arch/um/kernel/Makefile b/linux-um-nommu/arch/um/kernel/Makefile
+index 2f36d515762e..d17ea57e9755 100644
+--- a/linux-um-nommu/arch/um/kernel/Makefile
++++ b/linux-um-nommu/arch/um/kernel/Makefile
+@@ -16,7 +16,7 @@ extra-y := vmlinux.lds
+ clean-files :=
+ 
+ obj-y = config.o exec.o exitcode.o irq.o ksyms.o mem.o \
+-	physmem.o process.o ptrace.o reboot.o sigio.o \
++	physmem.o zpoline.o process.o ptrace.o reboot.o sigio.o \
+ 	signal.o syscall.o sysrq.o time.o tlb.o trap.o \
+ 	um_arch.o umid.o maccess.o kmsg_dump.o skas/
+ 
+diff --git a/linux-um-nommu/arch/um/kernel/process.c b/linux-um-nommu/arch/um/kernel/process.c
+index 26d89f1ae89b..3e6219444476 100644
+--- a/linux-um-nommu/arch/um/kernel/process.c
++++ b/linux-um-nommu/arch/um/kernel/process.c
+@@ -127,7 +127,7 @@ static void setup_seccomp(void)
+ 
+ 	save_kmalloc_ok = kmalloc_ok;
+ 	kmalloc_ok = 0;
+-	os_setup_seccomp();
++//	os_setup_seccomp();
+ 	kmalloc_ok = save_kmalloc_ok;
+ 	is_first = false;
+ }
+diff --git a/linux-um-nommu/arch/um/kernel/uml.lds.S b/linux-um-nommu/arch/um/kernel/uml.lds.S
+index 36b07ec09742..95e75d69103e 100644
+--- a/linux-um-nommu/arch/um/kernel/uml.lds.S
++++ b/linux-um-nommu/arch/um/kernel/uml.lds.S
+@@ -9,6 +9,14 @@ jiffies = jiffies_64;
+ 
+ SECTIONS
+ {
++  .zpoline.segment : {
++    __zpoline_start = 0x00000000;
++    *(.zpoline.init)
++    . = 0x00000000 + 0x00001000;
++    __zpoline_end = .;
++  }
++  PROVIDE_HIDDEN(__ehdr_start = 0x60000000);
++
+   /* This must contain the right address - not quite the default ELF one.*/
+   PROVIDE (__executable_start = START);
+   /* Static binaries stick stuff here, like the sigreturn trampoline,
+diff --git a/linux-um-nommu/arch/um/kernel/zpoline.c b/linux-um-nommu/arch/um/kernel/zpoline.c
+new file mode 100644
+index 000000000000..142da206cac2
+--- /dev/null
++++ b/linux-um-nommu/arch/um/kernel/zpoline.c
+@@ -0,0 +1,280 @@
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <asm/unistd.h>
++#include <os.h>
++
++/* XXX: move those code to x86-64 specifics */
++extern long __kernel_vsyscall(int64_t, int64_t, int64_t, int64_t,
++			      int64_t, int64_t, int64_t);
++extern char __zpoline_start[];
++
++void zpoline_panic(void)
++{
++	panic("zpoline");
++}
++
++long zpoline_syscall_hook(int64_t rdi, int64_t rsi,
++				 int64_t rdx, int64_t __rcx __attribute__((unused)),
++				 int64_t r8, int64_t r9,
++				 int64_t r10_on_stack /* 4th arg for syscall */,
++				 int64_t rax_on_stack,
++				 int64_t retptr)
++{
++	unsigned long ret = -1;
++
++	if (rax_on_stack == __NR_clone3) {
++		uint64_t *ca = (uint64_t *) rdi; /* struct clone_args */
++		if (ca[0] /* flags */ & CLONE_VM) {
++			ca[6] /* stack_size */ -= sizeof(uint64_t);
++			*((uint64_t *) (ca[5] /* stack */ + ca[6] /* stack_size */)) = retptr;
++		}
++	}
++
++	if (rax_on_stack == __NR_clone) {
++		if (rdi & CLONE_VM) { // pthread creation
++			/* push return address to the stack */
++			rsi -= sizeof(uint64_t);
++			*((uint64_t *) rsi) = retptr;
++		}
++	}
++
++	/* XXX: r9... */
++	__asm__ __volatile__ ("call *%1" : "=a"(ret)
++			      : "r"(__kernel_vsyscall), "a"(rax_on_stack),
++				"D"(rdi), "S"(rsi), "d"(rdx),
++				"r"(r10_on_stack), "r"(r8)//, "r"(_r9)
++			      : "rcx", "r11", "memory");
++
++	return ret;
++}
++
++void ____asm_impl(void)
++{
++	/*
++	 * enter_syscall triggers a kernel-space system call
++	 */
++	asm volatile (
++	".globl enter_syscall \n\t"
++	"enter_syscall: \n\t"
++	"movq %rdi, %rax \n\t"
++	"movq %rsi, %rdi \n\t"
++	"movq %rdx, %rsi \n\t"
++	"movq %rcx, %rdx \n\t"
++	"movq %r8, %r10 \n\t"
++	"movq %r9, %r8 \n\t"
++	"movq 8(%rsp),%r9 \n\t"
++	".globl syscall_addr \n\t"
++	"syscall_addr: \n\t"
++	"syscall \n\t"
++	"ret \n\t"
++	);
++
++	/*
++	 * asm_syscall_hook is the address where the
++	 * trampoline code first lands.
++	 *
++	 * the procedure below calls the C function
++	 * named syscall_hook.
++	 *
++	 * at the entry point of this,
++	 * the register values follow the calling convention
++	 * of the system calls.
++	 *
++	 * this part is a bit complicated.
++	 * commit e5afaba has a bit simpler versoin.
++	 *
++	 */
++	asm volatile (
++	".globl asm_syscall_hook \n\t"
++	"asm_syscall_hook: \n\t"
++
++#if 0
++	"cmpq $15, %rax \n\t" // rt_sigreturn
++	"je do_rt_sigreturn \n\t"
++#endif
++	"pushq %rbp \n\t"
++	"movq %rsp, %rbp \n\t"
++	/*
++	 * NOTE: for xmm register operations such as movaps
++	 * stack is expected to be aligned to a 16 byte boundary.
++	 */
++	"andq $-16, %rsp \n\t" // 16 byte stack alignment
++
++	/* assuming callee preserves r12-r15 and rbx  */
++
++	"pushq %r11 \n\t"
++	"pushq %r9 \n\t"
++	"pushq %r8 \n\t"
++	"pushq %rdi \n\t"
++	"pushq %rsi \n\t"
++	"pushq %rdx \n\t"
++	"pushq %rcx \n\t"
++
++	/* arguments for syscall_hook */
++
++	"pushq 8(%rbp) \n\t"	// return address
++	"pushq %rax \n\t"
++	"pushq %r10 \n\t"
++
++	/* up to here, stack has to be 16 byte aligned */
++	"callq zpoline_syscall_hook \n\t"
++//	"callq __kernel_vsyscall \n\t"
++
++	"popq %r10 \n\t"
++	"addq $16, %rsp \n\t"	// discard arg7 and arg8
++
++	"popq %rcx \n\t"
++	"popq %rdx \n\t"
++	"popq %rsi \n\t"
++	"popq %rdi \n\t"
++	"popq %r8 \n\t"
++	"popq %r9 \n\t"
++	"popq %r11 \n\t"
++
++	"leaveq \n\t"
++
++//	"addq $128, %rsp \n\t"
++
++	"retq \n\t"
++
++#if 0
++	"do_rt_sigreturn:"
++	"addq $136, %rsp \n\t"
++	"jmp syscall_addr \n\t"
++#endif
++	);
++}
++
++#include <asm/insn.h>
++int arch_finalize_exec(struct elfhdr *_ehdr, bool has_interp,
++			struct elfhdr *_interp_ehdr)
++{
++	int err = 0, count = 0;
++	struct insn insn;
++	struct mm_struct *mm = current->mm;
++	void *ptr, *head;
++	unsigned long stop;
++	struct elfhdr *ehdr = _interp_ehdr;
++
++	ptr = (void *)_interp_ehdr;
++	head = ptr;
++	stop = ehdr->e_shoff + ehdr->e_shentsize * ehdr->e_shnum;
++
++	/* skip translation of trampoline code */
++	if (ptr <= &__zpoline_start[0] + 0x1000 + 0x0100)
++		return - EINVAL;
++
++	if (down_write_killable(&mm->mmap_sem))
++		return -EINTR;
++
++
++	while (ptr < (head + stop)) {
++		insn_init(&insn, ptr, MAX_INSN_SIZE, 1);
++		insn_get_length(&insn);
++
++		insn_get_opcode(&insn);
++
++		switch (insn.opcode.bytes[0]) {
++		case 0xf:
++			switch (insn.opcode.bytes[1]) {
++			case 0x05: /* syscall */
++			case 0x34: /* sysenter */
++				//printk(KERN_INFO "zpoline: %lx: found syscall/sysenter\n", (unsigned long)ptr);
++				*(char*)ptr = 0xff; // callq
++				*((char *)ptr + 1) = 0xd0; // *%rax
++				count++;
++				break;
++			}
++		default:
++		}
++
++		ptr += insn.length;
++	}
++
++	printk(KERN_DEBUG "zpoline: rewritten %d syscalls\n", count);
++	up_write(&mm->mmap_sem);
++	return err;
++}
++
++static int setup_zpoline_trampoline(void)
++{
++	extern void asm_syscall_hook(void);
++	int i;
++
++	for (i = 0; i < NR_syscalls; i++)
++		__zpoline_start[i] = 0x90;
++
++	// optimization introduced by reviewer C
++	__zpoline_start[214 /* __NR_epoll_ctl_old */] = 0xeb; /* short jmp */
++	__zpoline_start[215 /* __NR_epoll_wait_old */] = 127; /* range of a short jmp : -128 ~ +127 */
++
++	/* 
++	 * put code for jumping to asm_syscall_hook.
++	 *
++	 * here we embed the following code.
++	 *
++	 * //sub    $0x80,%rsp
++	 * movabs [asm_syscall_hook],%r11
++	 * jmpq   *%r11
++	 *
++	 */
++
++#if 0
++	/* preserve redzone */
++	// 48 81 ec 80 00 00 00    sub    $0x80,%rsp
++	__zpoline_start[NR_syscalls + 0x00] = 0x48;
++	__zpoline_start[NR_syscalls + 0x01] = 0x81;
++	__zpoline_start[NR_syscalls + 0x02] = 0xec;
++	__zpoline_start[NR_syscalls + 0x03] = 0x80;
++	__zpoline_start[NR_syscalls + 0x04] = 0x00;
++	__zpoline_start[NR_syscalls + 0x05] = 0x00;
++	__zpoline_start[NR_syscalls + 0x06] = 0x00;
++
++	// 49 bb [64-bit addr (8-byte)]    movabs [64-bit addr (8-byte)],%r11
++	__zpoline_start[NR_syscalls + 0x00] = 0x49;
++	__zpoline_start[NR_syscalls + 0x01] = 0xbb;
++	__zpoline_start[NR_syscalls + 0x02] = ((uint64_t) asm_syscall_hook >> (8 * 0)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x03] = ((uint64_t) asm_syscall_hook >> (8 * 1)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x04] = ((uint64_t) asm_syscall_hook >> (8 * 2)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x05] = ((uint64_t) asm_syscall_hook >> (8 * 3)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x06] = ((uint64_t) asm_syscall_hook >> (8 * 4)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x07] = ((uint64_t) asm_syscall_hook >> (8 * 5)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x08] = ((uint64_t) asm_syscall_hook >> (8 * 6)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x09] = ((uint64_t) asm_syscall_hook >> (8 * 7)) & 0xff;
++
++	// 41 ff e3                jmp    *%r11
++	__zpoline_start[NR_syscalls + 0x0a] = 0x41;
++	__zpoline_start[NR_syscalls + 0x0b] = 0xff;
++	__zpoline_start[NR_syscalls + 0x0c] = 0xe3;
++#else
++	// XXX: musl vfork use rdx instead of rcx
++	// 48 89 d1                mov    %rdx,%rcx
++	__zpoline_start[NR_syscalls + 0x00] = 0x48;
++	__zpoline_start[NR_syscalls + 0x01] = 0x89;
++	__zpoline_start[NR_syscalls + 0x02] = 0xd1;
++
++	// 49 bb [64-bit addr (8-byte)]    movabs [64-bit addr (8-byte)],%r11
++	__zpoline_start[NR_syscalls + 0x03] = 0x49;
++	__zpoline_start[NR_syscalls + 0x04] = 0xbb;
++	__zpoline_start[NR_syscalls + 0x05] = ((uint64_t) __kernel_vsyscall >> (8 * 0)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x06] = ((uint64_t) __kernel_vsyscall >> (8 * 1)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x07] = ((uint64_t) __kernel_vsyscall >> (8 * 2)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x08] = ((uint64_t) __kernel_vsyscall >> (8 * 3)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x09] = ((uint64_t) __kernel_vsyscall >> (8 * 4)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x0a] = ((uint64_t) __kernel_vsyscall >> (8 * 5)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x0b] = ((uint64_t) __kernel_vsyscall >> (8 * 6)) & 0xff;
++	__zpoline_start[NR_syscalls + 0x0c] = ((uint64_t) __kernel_vsyscall >> (8 * 7)) & 0xff;
++
++	// 41 ff e3                jmp    *%r11
++	__zpoline_start[NR_syscalls + 0x0d] = 0x41;
++	__zpoline_start[NR_syscalls + 0x0e] = 0xff;
++	__zpoline_start[NR_syscalls + 0x0f] = 0xe3;
++
++
++#endif
++
++	os_protect_memory(0, 0x1000, 1, 1, 1);
++	printk(KERN_ERR "zpoline: setting up trampoline code done\n");
++	return 0;
++}
++__initcall(setup_zpoline_trampoline);
+diff --git a/linux-um-nommu/arch/um/os-Linux/process.c b/linux-um-nommu/arch/um/os-Linux/process.c
+index c00953965716..7ee64aa160d2 100644
+--- a/linux-um-nommu/arch/um/os-Linux/process.c
++++ b/linux-um-nommu/arch/um/os-Linux/process.c
+@@ -324,7 +324,7 @@ static const int allowed_list[] = {
+ 	SCMP_SYS(fcntl),
+ 	SCMP_SYS(rt_sigprocmask),
+ 	SCMP_SYS(ioctl),
+-	SCMP_SYS(open),
++	SCMP_SYS(openat),
+ 	SCMP_SYS(brk),
+ 	SCMP_SYS(getpid),
+ 
+diff --git a/linux-um-nommu/arch/um/os-Linux/skas/process.c b/linux-um-nommu/arch/um/os-Linux/skas/process.c
+index d66454be75a1..dd713d55daa8 100644
+--- a/linux-um-nommu/arch/um/os-Linux/skas/process.c
++++ b/linux-um-nommu/arch/um/os-Linux/skas/process.c
+@@ -126,6 +126,7 @@ static void handle_segv(int pid, struct uml_pt_regs *regs, unsigned long *aux_fp
+ 	segv(regs->faultinfo, 0, 1, NULL);
+ }
+ 
++#ifdef CONFIG_MMU
+ /*
+  * To use the same value of using_sysemu as the caller, ask it that value
+  * (in local_using_sysemu
+@@ -171,12 +172,12 @@ static void handle_trap(int pid, struct uml_pt_regs *regs,
+ 
+ 	handle_syscall(regs);
+ }
++#endif
+ 
+ extern char __syscall_stub_start[];
+ int userspace_pid[NR_CPUS];
+ 
+ #ifdef CONFIG_MMU
+-
+ /**
+  * userspace_tramp() - userspace trampoline
+  * @stack:	pointer to the new userspace stack page, can be NULL, if? FIXME:
+@@ -446,6 +447,7 @@ void userspace(struct uml_pt_regs *regs, unsigned long *aux_fp_regs)
+ }
+ #endif
+ 
++#ifdef CONFIG_MMU
+ static unsigned long thread_regs[MAX_REG_NR];
+ static unsigned long thread_fp_regs[FP_SIZE];
+ 
+@@ -464,7 +466,6 @@ static int __init init_thread_regs(void)
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_MMU
+ __initcall(init_thread_regs);
+ #endif
+ 
+diff --git a/linux-um-nommu/arch/um/os-Linux/user_syms.c b/linux-um-nommu/arch/um/os-Linux/user_syms.c
+index 715594fe5719..3fbf3778d889 100644
+--- a/linux-um-nommu/arch/um/os-Linux/user_syms.c
++++ b/linux-um-nommu/arch/um/os-Linux/user_syms.c
+@@ -76,7 +76,7 @@ EXPORT_SYMBOL_PROTO(futimes);
+ EXPORT_SYMBOL_PROTO(chmod);
+ EXPORT_SYMBOL_PROTO(fchmod);
+ EXPORT_SYMBOL_PROTO(rename);
+-EXPORT_SYMBOL_PROTO(__xmknod);
++//EXPORT_SYMBOL_PROTO(__xmknod);
+ 
+ EXPORT_SYMBOL_PROTO(symlink);
+ EXPORT_SYMBOL_PROTO(link);
+diff --git a/linux-um-nommu/arch/x86/um/Makefile b/linux-um-nommu/arch/x86/um/Makefile
+index e3651627f1ae..32c0bde22e73 100644
+--- a/linux-um-nommu/arch/x86/um/Makefile
++++ b/linux-um-nommu/arch/x86/um/Makefile
+@@ -16,6 +16,14 @@ obj-y = bugs_$(BITS).o delay.o fault.o ldt.o \
+ 	entry_$(BITS).o \
+ 	mem_$(BITS).o subarch.o os-$(OS)/
+ 
++inat_tables_script = $(srctree)/arch/x86/tools/gen-insn-attr-x86.awk
++inat_tables_maps = $(srctree)/arch/x86/lib/x86-opcode-map.txt
++quiet_cmd_inat_tables = GEN     $@
++      cmd_inat_tables = $(AWK) -f $(inat_tables_script) $(inat_tables_maps) > $@
++
++$(obj)/inat-tables.c: $(inat_tables_script) $(inat_tables_maps)
++	$(call cmd,inat_tables)
++
+ ifeq ($(CONFIG_X86_32),y)
+ 
+ obj-y += checksum_32.o syscalls_32.o
+@@ -27,7 +35,7 @@ else
+ 
+ obj-y += syscalls_64.o do_syscall_64.o vdso/
+ 
+-subarch-y = ../lib/csum-partial_64.o ../lib/memcpy_64.o ../entry/thunk_64.o
++subarch-y = ../lib/csum-partial_64.o ../lib/memcpy_64.o ../entry/thunk_64.o ../lib/insn.o ../lib/inat.o
+ 
+ endif
+ 
+diff --git a/linux-um-nommu/fs/binfmt_elf_fdpic.c b/linux-um-nommu/fs/binfmt_elf_fdpic.c
+index fe432b0405cf..1df2622d7cd3 100644
+--- a/linux-um-nommu/fs/binfmt_elf_fdpic.c
++++ b/linux-um-nommu/fs/binfmt_elf_fdpic.c
+@@ -187,6 +187,12 @@ static int elf_fdpic_fetch_phdrs(struct elf_fdpic_params *params,
+ 	return 0;
+ }
+ 
++int __weak arch_finalize_exec(struct elfhdr *ehdr, bool has_interp,
++			       struct elfhdr *interp_ehdr)
++{
++	return 0;
++}
++
+ /*****************************************************************************/
+ /*
+  * load an fdpic binary into various bits of memory
+@@ -471,6 +477,12 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm)
+ 			    dynaddr);
+ #endif
+ 
++	retval = arch_finalize_exec((struct elfhdr *) exec_params.elfhdr_addr,
++				    !!interpreter_name,
++				    (struct elfhdr *) interp_params.elfhdr_addr);
++	if (retval)
++		goto error;
++
+ 	finalize_exec(bprm);
+ 	/* everything is now ready... get the userspace context ready to roll */
+ 	entryaddr = interp_params.entry_addr ?: exec_params.entry_addr;
+@@ -679,7 +691,7 @@ static int create_elf_fdpic_tables(struct linux_binprm *bprm,
+ 	 */
+ 	ARCH_DLINFO;
+ #endif
+-	NEW_AUX_ENT(AT_SYSINFO, __kernel_vsyscall);
++	NEW_AUX_ENT(AT_SYSINFO, (elf_addr_t)__kernel_vsyscall);
+ #undef NEW_AUX_ENT
+ 
+ 	/* allocate room for argv[] and envv[] */
+@@ -804,7 +816,7 @@ static int elf_fdpic_map_file(struct elf_fdpic_params *params,
+ 				params->entry_addr =
+ 					(params->hdr.e_entry - seg->p_vaddr) +
+ 					seg->addr;
+-				kdebug("entry[%d]=%lx vaddr=%lx addr=%lx",
++				kdebug("entry[%d]=%llux vaddr=%llux addr=%llux",
+ 					loop, params->hdr.e_entry, seg->p_vaddr, seg->addr);
+ 				break;
+ 			}
+@@ -847,7 +859,8 @@ static int elf_fdpic_map_file(struct elf_fdpic_params *params,
+ 
+ 		seg = params->loadmap->segs;
+ 		for (loop = loadmap->nsegs; loop > 0; loop--, seg++) {
+-			kdebug("load segment p_vaddr=%lx seg->p_memsz", seg->p_vaddr, seg->p_memsz);
++			kdebug("load segment p_vaddr=%llx seg->p_memsz=%x",
++			       seg->p_vaddr, seg->p_memsz);
+ 			if (phdr->p_vaddr >= seg->p_vaddr &&
+ 			    phdr->p_vaddr + phdr->p_memsz <=
+ 			    seg->p_vaddr + seg->p_memsz) {
+@@ -915,7 +928,7 @@ static int elf_fdpic_map_file(struct elf_fdpic_params *params,
+ 	kdebug("- DYNAMIC[]: %lx", params->dynamic_addr);
+ 	seg = params->loadmap->segs;
+ 	for (loop = 0; loop < loadmap->nsegs; loop++, seg++)
+-		kdebug("- LOAD[%d] : %08x-%08x [va=%x ms=%x]",
++		kdebug("- LOAD[%d] : %08llx-%08llx [va=%llx ms=%x]",
+ 		       loop,
+ 		       seg->addr, seg->addr + seg->p_memsz - 1,
+ 		       seg->p_vaddr, seg->p_memsz);
+@@ -1110,7 +1123,7 @@ static int elf_fdpic_map_file_by_direct_mmap(struct elf_fdpic_params *params,
+ 		maddr = vm_mmap(file, maddr, phdr->p_memsz + disp, prot, flags,
+ 				phdr->p_offset - disp);
+ 
+-		kdebug("mmap[%d] <file> sz=%lx pr=%x fl=%x of=%lx --> %08lx",
++		kdebug("mmap[%d] <file> sz=%llux pr=%x fl=%x of=%llx --> %08lx",
+ 		       loop, phdr->p_memsz + disp, prot, flags,
+ 		       phdr->p_offset - disp, maddr);
+ 
+@@ -1174,7 +1187,7 @@ static int elf_fdpic_map_file_by_direct_mmap(struct elf_fdpic_params *params,
+ 
+ #else
+ 		if (excess > 0) {
+-			kdebug("clear[%d] ad=%lx sz=%lx",
++			kdebug("clear[%d] ad=%llux sz=%lx",
+ 			       loop, maddr + phdr->p_filesz, excess);
+ 			if (clear_user((void *) maddr + phdr->p_filesz, excess))
+ 				return -EFAULT;
+diff --git a/linux-um-nommu/fs/proc/task_nommu.c b/linux-um-nommu/fs/proc/task_nommu.c
+index 7907e6419e57..8e216ce9ace6 100644
+--- a/linux-um-nommu/fs/proc/task_nommu.c
++++ b/linux-um-nommu/fs/proc/task_nommu.c
+@@ -230,7 +230,8 @@ static void m_stop(struct seq_file *m, void *_vml)
+ {
+ 	struct proc_maps_private *priv = m->private;
+ 
+-	if (!IS_ERR_OR_NULL(_vml)) {
++//	if (!IS_ERR_OR_NULL(_vml)) {
++	if (unlikely(atomic_long_read(&priv->mm->mmap_sem.count) > 0)) {
+ 		up_read(&priv->mm->mmap_sem);
+ 		mmput(priv->mm);
+ 	}

@@ -8,6 +8,9 @@ VMLINUX ?= ../linux-um-nommu/vmlinux
 # ./image2rootfs.sh which doesn't require privileges and uses genext2fs
 # instead.
 
+ubuntu-test.ext3: init.sh entropy
+	sudo bash -c 'BUSYBOX_BUILD=$(BUSYBOX_BUILD) MUSL_BUILD=$(MUSL_BUILD) ./image2rootfs_mount.sh ubuntu 22.04 ext3'
+
 alpine-test.ext3: init.sh entropy
 	sudo bash -c 'BUSYBOX_BUILD=$(BUSYBOX_BUILD) MUSL_BUILD=$(MUSL_BUILD) ./image2rootfs_mount.sh kollerr/alpine-test latest ext3'
 
